@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { Logger } from '../../infra/logger.js';
+import type { AmostraPosicao } from './telemetry.types.js';
 
 const require_ = createRequire(import.meta.url);
 const { encodeBatch, compressionRatio } = require_('../../../vendor/fleet-telemetry-sdk/src/position-codec.js');
@@ -7,15 +8,7 @@ const { encodeBatch, compressionRatio } = require_('../../../vendor/fleet-teleme
 // mesmo ciclo do despejo
 const { 批量上报队列 } = require_('../../../vendor/jt808-telematics/批量上报队列.js');
 
-interface AmostraPosicao {
-  driverId: number;
-  cityId: number;
-  lat: number;
-  lng: number;
-  speed: number;
-  accuracy: number;
-  em: number;
-}
+
 
 /**
  * Exportador de telemetria de posição.

@@ -23,6 +23,10 @@ import { GeocodingService } from './modules/geocoding/geocoding.service.js';
 import { TelemetryService } from './modules/telemetry/telemetry.service.js';
 import { TelemetryExporter } from './modules/telemetry/telemetry.exporter.js';
 import { PainelService } from './modules/painel/painel.service.js';
+import {
+  FleetLinkTelemetrySink,
+  LocalTelemetrySink,
+} from './modules/telemetry/telemetry.sink.js';
 
 const require_ = createRequire(import.meta.url);
 const { TelemetryUploader } = require_('../vendor/fleet-telemetry-sdk/src/telemetry-uploader.js');
@@ -59,15 +63,30 @@ async function bootstrap() {
     endpoint: process.env.FLEETLINK_ENDPOINT,
     logger,
   });
-  await uploaderVendor.start();
+  const uploaderAtivo = await uploaderVendor.start();
 
   const telemetryExporter = new TelemetryExporter();
-  telemetryExporter.iniciar();
+
+  
+
+  if (!uploaderAtivo) {
+    telemetryExporter.iniciar();
+    logger.info('[Telemetry] usando exporter próprio como fallback');
+  }
+
+  const telemetrySink = uploaderAtivo
+  ? new FleetLinkTelemetrySink(uploaderVendor)
+  : new LocalTelemetrySink(telemetryExporter);
 
   const painelService = new PainelService(emitter);
 
   new EventsGateway(
-    io, emitter, salas, driverService, telemetryService, telemetryExporter, uploaderVendor,
+    io,
+    emitter,
+    salas,
+    driverService,
+    telemetryService,
+    telemetrySink,
   ).registrar();
 
   // -- rotas ------------------------------------------------------------------

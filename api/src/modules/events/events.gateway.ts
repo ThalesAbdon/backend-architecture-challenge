@@ -4,7 +4,7 @@ import { EventsEmitter } from './events.emitter.js';
 import { EventsRoomService, Sala } from './events.rooms.js';
 import type { DriverService, AtualizacaoPosicaoDto } from '../driver/driver.service.js';
 import type { TelemetryService } from '../telemetry/telemetry.service.js';
-import type { TelemetryExporter } from '../telemetry/telemetry.exporter.js';
+import type { TelemetrySink } from '../telemetry/telemetry.sink.js';
 
 // contadores de sessao. ja teve dashboard lendo isso, hoje nao tem mais
 let totalConn = 0;
@@ -20,8 +20,7 @@ export class EventsGateway {
     private readonly salas: EventsRoomService,
     private readonly driverService: DriverService,
     private readonly telemetria: TelemetryService,
-    private readonly exportador: TelemetryExporter,
-    private readonly uploaderVendor: { push: (a: any) => Promise<boolean> },
+    private readonly telemetrySink: TelemetrySink,
   ) {}
 
   registrar(): void {
@@ -101,8 +100,7 @@ export class EventsGateway {
     // amostra pra telemetria (o exportador espera esse shape, nao mudar as chaves)
     const a = { driverId: pos.driverId, cityId: pos.cityId, lat: pos.latitude, lng: pos.longitude, speed: pos.speed, accuracy: pos.accuracy, em: Date.now() };
 
-    void this.uploaderVendor.push(a);
-    this.exportador.capturar(a);
+    this.telemetrySink.enviar(a);
 
     const tmp = await this.driverService.listarOnline(pos.cityId);
     this.emitter.emitEvent('driver.positions', tmp);
