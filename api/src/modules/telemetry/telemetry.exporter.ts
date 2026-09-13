@@ -23,6 +23,7 @@ export class TelemetryExporter {
   private readonly endpoint = process.env.TELEMETRY_ENDPOINT ?? '';
   private readonly loteMax = Number(process.env.TELEMETRY_BATCH ?? 200);
   private readonly flushMs = Number(process.env.TELEMETRY_FLUSH_MS ?? 30000);
+  private readonly timeoutMs = Number(process.env.TELEMETRY_TIMEOUT_MS ?? 5000);
 
   private buffer: AmostraPosicao[] = [];
   private ciclo: NodeJS.Timeout | null = null;
@@ -75,10 +76,14 @@ export class TelemetryExporter {
     const quadro: Buffer = encodeBatch(amostras);
 
     try {
+      // Sem isso, um coletor que aceita a conexao mas nunca responde deixa
+      // a request pendurada pra sempre -- e como despejar() roda a cada
+      // flushMs sem esperar a chamada anterior, elas se acumulam sem limite.
       await fetch(this.endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
         body: quadro,
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
 
       this.contadores.lotes++;

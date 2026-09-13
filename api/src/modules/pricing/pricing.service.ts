@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Logger } from '../../infra/logger.js';
+import { hoje } from '../../utils.js';
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const ARQUIVO_TARIFAS = join(AQUI, 'tarifas.json');
@@ -43,14 +44,21 @@ export class PricingService {
     const inicio = performance.now();
     const tabela = this.carregarTabela();
 
+    // As datas sao "YYYY-MM-DD", entao a comparacao lexicografica com
+    // hoje() equivale a comparacao cronologica.
+    const hojeStr = hoje();
+    const vigente = (f: FaixaTarifaria) =>
+      f.vigenciaInicio <= hojeStr && hojeStr <= f.vigenciaFim;
+
     const faixa =
       tabela.find(
         (f) =>
+          vigente(f) &&
           f.cidade === entrada.cidade &&
           f.categoria === entrada.categoria &&
           f.zona === (entrada.zona ?? 'centro') &&
           f.bandeira === (entrada.bandeira ?? 1),
-      ) ?? tabela.find((f) => f.cidade === entrada.cidade && f.categoria === entrada.categoria);
+      ) ?? tabela.find((f) => vigente(f) && f.cidade === entrada.cidade && f.categoria === entrada.categoria);
 
     if (!faixa) {
       this.logger.warn('sem faixa tarifária para a combinação', entrada);
