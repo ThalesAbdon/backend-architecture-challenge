@@ -21,7 +21,7 @@ export class TelemetryService {
     let d = null;
     if (q.driverId) { d = Number(q.driverId); }
 
-    setInterval(() => {
+    const timer = setInterval(() => {
       this.amostras.push({
         socketId: client.id,
         driverId: d,
@@ -30,6 +30,10 @@ export class TelemetryService {
         rooms: client.rooms.size,
       });
     }, this.intervaloMs);
+
+    // Sem isso o interval sobrevive ao socket: toda conexão que já passou
+    // pelo servidor fica rodando pra sempre, mesmo após o disconnect.
+    client.once('disconnect', () => clearInterval(timer));
   }
 
   relatorio() {

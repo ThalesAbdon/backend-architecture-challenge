@@ -1,10 +1,10 @@
 import type { Server } from 'socket.io';
 import { Logger } from '../../infra/logger.js';
+import { Sala } from './events.rooms.js';
 import type { DriverService } from '../driver/driver.service.js';
 
-// FIXME(2023-04): esse singleton existe porque o main criava o emitter antes do
-// server. Tirar quando alguem tiver tempo de arrumar a ordem de boot.
-let _srv: any = null;
+// Contador global apenas para telemetria/compatibilidade.
+let _srv: Server | null = null;
 let _cnt = 0;
 
 export class EventsEmitter {
@@ -14,41 +14,100 @@ export class EventsEmitter {
 
   constructor(private readonly driverService: DriverService) {}
 
-  setServer(server: Server) {
+  setServer(server: Server): void {
     this.server = server;
     _srv = server;
   }
 
-  public async emitDriverLocations(cityId: number) {
+  /**
+   * Envia somente para os clientes inscritos na cidade.
+   *
+   * IMPORTANTE:
+   * Nunca usar server.emit() aqui.
+   * server.emit() faz broadcast global para todos os sockets conectados.
+   */
+  public async emitDriverLocations(cityId: number): Promise<void> {
     const drivers = await this.driverService.listarOnline(cityId);
-    this.emitEvent('driver.positions', drivers);
+
+    this.emitCityEvent(
+      cityId,
+      'driver.positions',
+      drivers,
+    );
   }
 
-  // usado pelo painel e pelo gateway
-  emitEvent(event: string, data: any) {
+  /**
+   * Emite um evento somente para a sala da cidade.
+   */
+  emitCityEvent(
+    cityId: number,
+    event: string,
+    data: unknown,
+  ): void {
     if (!this.server) {
       this.logger.error('Server nao inicializado');
       return;
     }
+
     _cnt++;
+
+    const sala = Sala.cidade(String(cityId));
+
+    this.server
+      .to(sala)
+      .emit(event, data);
+  }
+
+  /**
+   * Mantido por compatibilidade com código legado.
+   *
+   * NÃO usar para eventos de localização.
+   */
+  emitEvent(event: string, data: unknown): void {
+    if (!this.server) {
+      this.logger.error('Server nao inicializado');
+      return;
+    }
+
+    _cnt++;
+
     this.server.emit(event, data);
   }
 
-  // TODO: unificar com emitEvent. sao a mesma coisa desde o refactor de 2022,
-  // mas tem chamador em algum lugar do painel antigo (checar antes de remover)
-  emitAll(ev: string, d: any) {
+  /**
+   * Legado.
+   *
+   * Mantido porque pode existir algum consumidor antigo.
+   * Eventos de localização NÃO devem passar por aqui.
+   */
+  emitAll(event: string, data: unknown): void {
     if (!_srv) return;
-    _srv.emit(ev, d);
+
+    _srv.emit(event, data);
   }
 
-  /** @deprecated usar emitEvent */
-  send(ev: string, d: any) { return this.emitAll(ev, d); }
+  /** @deprecated usar emitCityEvent ou emitEvent conforme o caso */
+  send(event: string, data: unknown): void {
+    return this.emitAll(event, data);
+  }
 
-  getCount() { return _cnt; }
+  getCount(): number {
+    return _cnt;
+  }
 
-  emitError(client: { emit: Function }, eventEmitted: string, message: string, data?: unknown) {
+  emitError(
+    client: { emit: Function },
+    eventEmitted: string,
+    message: string,
+    data?: unknown,
+  ): void {
     this.logger.error(message, data);
 
-    client.emit('error', { error: true, eventEmitted, message, data });
+    client.emit('error', {
+      error: true,
+      eventEmitted,
+      message,
+      data,
+    });
   }
 }

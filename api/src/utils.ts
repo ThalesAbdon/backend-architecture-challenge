@@ -4,6 +4,11 @@
 
 export const CACHE: Record<string, any> = {};
 
+// Limite duro de entradas. Sem isso, uma rota publica que monta a chave a
+// partir de query params arbitrarios (ex: GET /drivers?cityId=X&limit=Y)
+// cresce o cache pra sempre, uma entrada por combinacao distinta.
+const LIMITE_CACHE = 500;
+
 export function hoje() {
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
@@ -44,7 +49,15 @@ export function esperar(ms: number) { return new Promise((r) => setTimeout(r, ms
 export function chave(...partes: any[]) { return partes.join(':'); }
 
 // guarda no cache de processo. sem TTL: quem colocar aqui e responsavel por tirar
-export function guardar(k: string, v: any) { CACHE[k] = v; }
+export function guardar(k: string, v: any) {
+  if (!(k in CACHE)) {
+    const chaves = Object.keys(CACHE);
+    if (chaves.length >= LIMITE_CACHE) {
+      delete CACHE[chaves[0]];
+    }
+  }
+  CACHE[k] = v;
+}
 export function pegar(k: string) { return CACHE[k]; }
 
 export function paginar(lista: any[], pagina: number, porPagina: number) {

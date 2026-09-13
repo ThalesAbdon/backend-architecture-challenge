@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { Logger } from '../../infra/logger.js';
+import type { AmostraPosicao } from './telemetry.types.js';
 
 const require_ = createRequire(import.meta.url);
 const { encodeBatch, compressionRatio } = require_('../../../vendor/fleet-telemetry-sdk/src/position-codec.js');
@@ -7,15 +8,7 @@ const { encodeBatch, compressionRatio } = require_('../../../vendor/fleet-teleme
 // mesmo ciclo do despejo
 const { 批量上报队列 } = require_('../../../vendor/jt808-telematics/批量上报队列.js');
 
-interface AmostraPosicao {
-  driverId: number;
-  cityId: number;
-  lat: number;
-  lng: number;
-  speed: number;
-  accuracy: number;
-  em: number;
-}
+
 
 /**
  * Exportador de telemetria de posição.
@@ -30,6 +23,7 @@ export class TelemetryExporter {
   private readonly endpoint = process.env.TELEMETRY_ENDPOINT ?? '';
   private readonly loteMax = Number(process.env.TELEMETRY_BATCH ?? 200);
   private readonly flushMs = Number(process.env.TELEMETRY_FLUSH_MS ?? 30000);
+  private readonly timeoutMs = Number(process.env.TELEMETRY_TIMEOUT_MS ?? 5000);
 
   private buffer: AmostraPosicao[] = [];
   private ciclo: NodeJS.Timeout | null = null;
@@ -74,7 +68,7 @@ export class TelemetryExporter {
     // drena o que ja passou da janela de reordenacao
     this.fila808.批量出队(this.loteMax);
 
-    // Empacota com o codec do SDK: ~15x sobre o JSON equivalente.
+    // Empacota com o codec do SDK: ~10x sobre o JSON equivalente (medido).
     const amostras = lote.map((a) => ({
       driverId: a.driverId, lat: a.lat, lng: a.lng, speed: a.speed, at: a.em,
     }));
@@ -82,10 +76,14 @@ export class TelemetryExporter {
     const quadro: Buffer = encodeBatch(amostras);
 
     try {
+      // Sem isso, um coletor que aceita a conexao mas nunca responde deixa
+      // a request pendurada pra sempre -- e como despejar() roda a cada
+      // flushMs sem esperar a chamada anterior, elas se acumulam sem limite.
       await fetch(this.endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
         body: quadro,
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
 
       this.contadores.lotes++;

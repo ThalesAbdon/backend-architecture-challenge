@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Logger } from '../../infra/logger.js';
+import { hoje } from '../../utils.js';
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const ARQUIVO_TARIFAS = join(AQUI, 'tarifas.json');
@@ -43,14 +44,36 @@ export class PricingService {
     const inicio = performance.now();
     const tabela = this.carregarTabela();
 
+    // As datas sao "YYYY-MM-DD", entao a comparacao lexicografica equivale
+    // a cronologica. Usamos so vigenciaInicio (a mais recente que ja
+    // comecou), nao o intervalo [inicio,fim]: o vigenciaFim publicado vem
+    // sempre fixo no dia 28, nao no ultimo dia real do mes -- usar os dois
+    // como intervalo fechado cria um buraco de 1 a 3 dias por mes sem
+    // nenhuma faixa valida, e deixa de cobrir qualquer data depois do
+    // ultimo mes publicado. Pegar a faixa de inicio mais recente que ja
+    // comecou nao tem essas duas falhas: ela vale ate ser substituida por
+    // uma faixa mais nova, nunca "expira" sem substituta.
+    const hojeStr = hoje();
+    const jaComecou = (f: FaixaTarifaria) => f.vigenciaInicio <= hojeStr;
+
+    const maisRecente = (lista: FaixaTarifaria[]): FaixaTarifaria | undefined =>
+      lista
+        .filter(jaComecou)
+        .reduce<FaixaTarifaria | undefined>(
+          (melhor, f) => (!melhor || f.vigenciaInicio > melhor.vigenciaInicio ? f : melhor),
+          undefined,
+        );
+
     const faixa =
-      tabela.find(
-        (f) =>
-          f.cidade === entrada.cidade &&
-          f.categoria === entrada.categoria &&
-          f.zona === (entrada.zona ?? 'centro') &&
-          f.bandeira === (entrada.bandeira ?? 1),
-      ) ?? tabela.find((f) => f.cidade === entrada.cidade && f.categoria === entrada.categoria);
+      maisRecente(
+        tabela.filter(
+          (f) =>
+            f.cidade === entrada.cidade &&
+            f.categoria === entrada.categoria &&
+            f.zona === (entrada.zona ?? 'centro') &&
+            f.bandeira === (entrada.bandeira ?? 1),
+        ),
+      ) ?? maisRecente(tabela.filter((f) => f.cidade === entrada.cidade && f.categoria === entrada.categoria));
 
     if (!faixa) {
       this.logger.warn('sem faixa tarifária para a combinação', entrada);

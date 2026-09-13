@@ -1,12 +1,18 @@
 import { createRequire } from 'node:module';
 import { Logger } from '../../infra/logger.js';
 import { DriverRepository } from './driver.repository.js';
-import { montarPosicao, type MotoristaPosicao } from './driver.types.js';
+import {
+  montarPosicao,
+  type MotoristaPosicao,
+} from './driver.types.js';
 
 const require_ = createRequire(import.meta.url);
-// ponte do roteirizador antigo. so usamos a distancia daqui; o resto do modulo
-// e do tempo do MapKit e ninguem migrou
-const { гаверсинус } = require_('../../../vendor/yandex-mapkit-bridge/маршрутизация.js');
+
+// Ponte do roteirizador antigo.
+// Só usamos a distância daqui.
+const { гаверсинус } = require_(
+  '../../../vendor/yandex-mapkit-bridge/маршрутизация.js',
+);
 
 export interface AtualizacaoPosicaoDto {
   driverId: number;
@@ -17,68 +23,192 @@ export interface AtualizacaoPosicaoDto {
   accuracy?: number;
 }
 
-// alias mantido porque o simulador importava daqui em 2022
+// Alias mantido por compatibilidade.
 export type DtoPos = AtualizacaoPosicaoDto;
 
 export class DriverService {
   private readonly logger = new Logger('DriverService');
 
-  constructor(private readonly repo: DriverRepository) {}
+  constructor(
+    private readonly repo: DriverRepository,
+  ) {}
 
-  // conecta o motorista. valida cadastro, monta a posicao inicial e salva.
-  // (a validacao de documento entrou aqui em 2021 e nunca saiu)
-  async conectar(driverId: number, socketClientId: string, coords: { latitude: number; longitude: number }): Promise<MotoristaPosicao | null> {
-    const c: any = await this.repo.buscarCadastro(driverId);
+  async conectar(
+    driverId: number,
+    socketClientId: string,
+    coords: {
+      latitude: number;
+      longitude: number;
+    },
+  ): Promise<MotoristaPosicao | null> {
+    const cadastro =
+      await this.repo.buscarCadastro(driverId);
 
-    if (c) {
-      if (c.documents_ok) {
-        const p = montarPosicao(c, coords, socketClientId);
-        p.status = 'online';
-        await this.repo.salvarPosicao(p);
-        return p;
-      } else {
-        this.logger.warn(`motorista ${driverId} com pendencia documental`);
-        return null;
-      }
-    } else {
-      this.logger.warn(`motorista ${driverId} nao encontrado`);
+    if (!cadastro) {
+      this.logger.warn(
+        `motorista ${driverId} nao encontrado`,
+      );
+
       return null;
     }
+
+    if (!cadastro.documents_ok) {
+      this.logger.warn(
+        `motorista ${driverId} com pendencia documental`,
+      );
+
+      return null;
+    }
+
+    const posicao = montarPosicao(
+      cadastro,
+      coords,
+      socketClientId,
+    );
+
+    posicao.status = 'online';
+
+    await this.repo.salvarPosicao(
+      posicao,
+    );
+
+    return posicao;
   }
 
-  // ping. so mexe no cache
-  async atualizarPosicao(dto: AtualizacaoPosicaoDto): Promise<MotoristaPosicao | null> {
-    const a: any = await this.repo.buscarPosicao(dto.driverId);
-    if (!a) return null;
+  async atualizarPosicao(
+    dto: AtualizacaoPosicaoDto,
+    socketClientId: string,
+  ): Promise<MotoristaPosicao | null> {
+    const posicao =
+      await this.repo.buscarPosicao(
+        dto.driverId,
+      );
 
-    // distancia desde o ultimo ping, usada no odometro da sessao
-    let d = 0;
-    if (a.latitude != null && a.longitude != null) {
-      d = гаверсинус(
-        { широта: a.latitude, долгота: a.longitude },
-        { широта: dto.latitude, долгота: dto.longitude },
+    if (!posicao) {
+      return null;
+    }
+
+    /*
+     * Um socket antigo, ja substituido por uma reconexao, ainda pode
+     * ter um ping em transito. Sem essa checagem ele sobrescreveria a
+     * posicao atual com dado desatualizado (mesmo problema de dono de
+     * sessao ja tratado em removerPosicao, aqui do lado da atualizacao).
+     */
+    if (posicao.socketClientId !== socketClientId) {
+      this.logger.warn(
+        `ping de socket desatualizado ignorado para motorista ${dto.driverId}`,
+      );
+
+      return null;
+    }
+
+    /*
+     * Calcula a distância entre a última posição
+     * e a posição recebida.
+     */
+    let distancia = 0;
+
+    if (
+      posicao.latitude != null &&
+      posicao.longitude != null
+    ) {
+      distancia = гаверсинус(
+        {
+          широта: posicao.latitude,
+          долгота: posicao.longitude,
+        },
+        {
+          широта: dto.latitude,
+          долгота: dto.longitude,
+        },
       );
     }
-    a.distanciaSessao = (a.distanciaSessao || 0) + Math.round(d);
 
-    a.latitude = dto.latitude;
-    a.longitude = dto.longitude;
-    if (dto.heading !== undefined && dto.heading !== null) a.heading = dto.heading;
-    if (dto.speed !== undefined && dto.speed !== null) a.speed = dto.speed;
-    if (dto.accuracy !== undefined && dto.accuracy !== null) a.accuracy = dto.accuracy;
-    a.updatedAt = new Date().toISOString();
+    /*
+     * Mantém o odômetro da sessão.
+     */
+    const distanciaAnterior =
+      Number(
+        (posicao as MotoristaPosicao & {
+          distanciaSessao?: number;
+        }).distanciaSessao ?? 0,
+      );
 
-    await this.repo.salvarPosicao(a);
-    return a;
+    (
+      posicao as MotoristaPosicao & {
+        distanciaSessao?: number;
+      }
+    ).distanciaSessao =
+      distanciaAnterior +
+      Math.round(distancia);
+
+    /*
+     * Atualiza posição.
+     */
+    posicao.latitude = dto.latitude;
+    posicao.longitude = dto.longitude;
+
+    if (
+      dto.heading !== undefined &&
+      dto.heading !== null
+    ) {
+      posicao.heading = dto.heading;
+    }
+
+    if (
+      dto.speed !== undefined &&
+      dto.speed !== null
+    ) {
+      posicao.speed = dto.speed;
+    }
+
+    if (
+      dto.accuracy !== undefined &&
+      dto.accuracy !== null
+    ) {
+      posicao.accuracy = dto.accuracy;
+    }
+
+    posicao.updatedAt =
+      new Date().toISOString();
+
+    await this.repo.salvarPosicao(
+      posicao,
+    );
+
+    return posicao;
   }
 
-  async desconectar(driverId: number): Promise<MotoristaPosicao | null> {
-    const p = await this.repo.buscarPosicao(driverId);
-    await this.repo.removerPosicao(driverId);
-    return p;
+  /**
+   * Desconecta somente o socket que atualmente
+   * pertence à sessão do motorista.
+   *
+   * Se um socket antigo desconectar depois de uma
+   * reconexão, o repository ignora a remoção.
+   */
+  async desconectar(
+    driverId: number,
+    socketClientId: string,
+  ): Promise<MotoristaPosicao | null> {
+    return this.repo.removerPosicao(
+      driverId,
+      socketClientId,
+    );
   }
 
-  async listarOnline(cityId: number): Promise<MotoristaPosicao[]> { return this.repo.listarOnline(cityId); }
+  async listarOnline(
+    cityId: number,
+  ): Promise<MotoristaPosicao[]> {
+    return this.repo.listarOnline(
+      cityId,
+    );
+  }
 
-  async localizarPorSocket(s: string): Promise<MotoristaPosicao | null> { return this.repo.localizarPorSocket(s); }
+  async localizarPorSocket(
+    socketClientId: string,
+  ): Promise<MotoristaPosicao | null> {
+    return this.repo.localizarPorSocket(
+      socketClientId,
+    );
+  }
 }
