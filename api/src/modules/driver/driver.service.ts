@@ -77,6 +77,7 @@ export class DriverService {
 
   async atualizarPosicao(
     dto: AtualizacaoPosicaoDto,
+    socketClientId: string,
   ): Promise<MotoristaPosicao | null> {
     const posicao =
       await this.repo.buscarPosicao(
@@ -84,6 +85,20 @@ export class DriverService {
       );
 
     if (!posicao) {
+      return null;
+    }
+
+    /*
+     * Um socket antigo, ja substituido por uma reconexao, ainda pode
+     * ter um ping em transito. Sem essa checagem ele sobrescreveria a
+     * posicao atual com dado desatualizado (mesmo problema de dono de
+     * sessao ja tratado em removerPosicao, aqui do lado da atualizacao).
+     */
+    if (posicao.socketClientId !== socketClientId) {
+      this.logger.warn(
+        `ping de socket desatualizado ignorado para motorista ${dto.driverId}`,
+      );
+
       return null;
     }
 

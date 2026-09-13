@@ -812,14 +812,34 @@ motorista X conectado
 
 sem que a sessão nova fosse indevidamente apagada.
 
-## Duas janelas de corrida relacionadas, identificadas mas não corrigidas
+## Duas janelas de corrida relacionadas
 
-Numa revisão posterior, mais ampla, foram encontradas duas janelas de corrida vizinhas a essa — ambas reais, ambas estreitas e autolimitadas por TTL, e por isso deixadas como limitação conhecida em vez de correção:
+Numa revisão posterior, mais ampla, foram encontradas duas janelas de corrida vizinhas a essa:
 
-1. **`atualizarPosicao()` não valida o dono do socket.** A proteção acima (`removerPosicao`) só existe no caminho de *desconexão*. `atualizarPosicao(dto)` (`driver.service.ts`) busca a posição só por `driverId` e nunca compara `socketClientId` — então, na janela em que um socket antigo ainda não desconectou de fato mas já foi substituído por uma reconexão, um ping tardio do socket antigo ainda é aceito e atualiza a posição (e reseta o TTL). Corrigir isso exigiria propagar `socketClientId` também no fluxo de `driver.location`, hoje só usado no fluxo de conexão/desconexão.
-2. **TOCTOU entre `removerPosicao` e `salvarPosicao`.** Nenhum dos dois usa `WATCH`/transação otimista do Redis — ambos fazem `GET` e decidem em JS antes de escrever. Um `disconnect` e um ping tardio do mesmo `driverId` intercalados podem, em teoria, fazer uma sessão recém-removida "ressuscitar" por um instante.
+1. **`atualizarPosicao()` não validava o dono do socket — corrigido.** A proteção acima (`removerPosicao`) existia só no caminho de *desconexão*. `atualizarPosicao(dto)` (`driver.service.ts`) buscava a posição só por `driverId` e nunca comparava `socketClientId` — então, na janela em que um socket antigo ainda não tinha desconectado de fato mas já havia sido substituído por uma reconexão, um ping tardio do socket antigo ainda era aceito e sobrescrevia a posição (com dado desatualizado) e resetava o TTL.
 
-Nenhuma das duas depende do broadcast global (já corrigido) e ambas se autocorrigem pelo TTL de posição em segundos — não ficam presas de forma permanente. Ficam registradas aqui em vez de corrigidas porque a correção completa exigiria mudar o contrato de `driver.location` (adicionar `socketClientId` ao payload que o app do motorista já envia), o que está fora do escopo do chamado original.
+   A correção **não precisou mudar o contrato de `driver.location`** nem o app do motorista: o servidor já sabe qual socket enviou cada ping (`client.id`, disponível em `events.gateway.ts`) sem precisar que o cliente mande nada a mais. `atualizarPosicao()` passou a receber esse `socketClientId` como segundo parâmetro e rejeita a atualização se não bater com o dono atual da sessão — mesma checagem que `removerPosicao()` já fazia, só que do lado da atualização:
+
+   ```typescript
+   async atualizarPosicao(dto: AtualizacaoPosicaoDto, socketClientId: string) {
+     const posicao = await this.repo.buscarPosicao(dto.driverId);
+     if (!posicao) return null;
+
+     if (posicao.socketClientId !== socketClientId) {
+       this.logger.warn(`ping de socket desatualizado ignorado para motorista ${dto.driverId}`);
+       return null;
+     }
+     // ... resto da atualização
+   }
+   ```
+
+   **Validado ao vivo**: conectei o socket A como motorista 1, depois o socket B (simulando reconexão do mesmo motorista — o servidor passa a considerar B o dono). Socket A manda um ping tardio com coordenada `-99,-99`; socket B manda um ping legítimo com coordenada real. `GET /drivers/online?cityId=2` mostra a posição final vinda de B (`socketClientId` de B, coordenada de B), e o log confirma: `ping de socket desatualizado ignorado para motorista 1`. O ping de A nunca chegou a sobrescrever nada.
+
+2. **TOCTOU entre `removerPosicao` e `salvarPosicao` — não corrigido.** Nenhum dos dois usa `WATCH`/transação atômica do Redis — ambos fazem `GET` e decidem em JS antes de escrever. Um `disconnect` e um ping tardio do mesmo socket intercalados podem, em teoria, fazer uma sessão recém-removida "ressuscitar" por um instante, até o TTL de posição expirar de novo.
+
+   Corrigir isso de verdade exigiria tornar a operação atômica no Redis — via `WATCH`/`MULTI`/`EXEC` otimista ou um script Lua (`EVAL`). `WATCH` tem uma pegadinha aqui: `infra/redis.ts` usa um único client Redis compartilhado por toda a aplicação, e `WATCH` é por conexão — fazer isso direito exigiria uma conexão dedicada por transação (`client.duplicate()`), mais uma peça de ciclo de vida pra gerenciar. Um script Lua evitaria esse problema (atomicidade garantida pelo servidor, não pela conexão), mas seria a primeira peça desse tipo no projeto — mais superfície nova, mais difícil de testar com confiança de que não introduz um bug mais sutil que a race atual.
+
+   Avaliado o custo-benefício: essa race exige uma janela de tempo bem específica, se autocorrige em poucos segundos (TTL) e não depende do broadcast global (já corrigido). Decisão consciente: manter como limitação conhecida em vez de introduzir uma peça nova (Lua) só pra fechar uma race estreita e autolimitada.
 
 ---
 
@@ -1548,12 +1568,12 @@ Em um ambiente com múltiplas instâncias da API, seria necessário avaliar uma 
 
 ---
 
-## 4. Achados de uma revisão ampla, deixados como limitação conhecida (não corrigidos)
+## 4. Achados de uma revisão ampla
 
-Depois de fechar os pontos do chamado original e os bugs corrigidos acima, uma revisão mais ampla (8 auditorias independentes, cobrindo o projeto inteiro — backend, frontend, vendor e a entrega em si) encontrou mais alguns pontos reais, mas que ficaram deliberadamente fora do escopo desta correção:
+Depois de fechar os pontos do chamado original e os bugs corrigidos acima, uma revisão mais ampla (8 auditorias independentes, cobrindo o projeto inteiro — backend, frontend, vendor e a entrega em si) encontrou mais alguns pontos reais. Um foi corrigido (barato e de baixo risco); os demais ficaram deliberadamente fora do escopo desta correção:
 
-* **`atualizarPosicao()` não valida o dono do socket** (`driver.service.ts`) — só a desconexão valida `socketClientId` (ver "Concorrência na desconexão"). Um ping tardio de um socket já substituído por reconexão ainda é aceito, causando um "pisco" transitório de posição (~1 ciclo de ping) até o socket correto corrigir. Cenário concreto e não raro (reconexão por instabilidade de rede é o caso normal de um app de motorista), mas autolimitado.
-* **TOCTOU entre `removerPosicao`/`salvarPosicao`** (mesmo arquivo) — sem `WATCH`/transação atômica no Redis. Na pior hipótese, cria um "motorista fantasma" (aparece como online com posição desatualizada) até o TTL de posição expirar. Corrigir de verdade exigiria um script Lua ou transação otimista no Redis — mudança de escopo maior que o chamado.
+* ~~`atualizarPosicao()` não valida o dono do socket~~ — **corrigido** (ver "Concorrência na desconexão" / "Duas janelas de corrida relacionadas"). Passou a receber `socketClientId` (o `client.id` que o gateway já tem) e rejeita pings de um socket que não é mais o dono da sessão, sem precisar mudar o contrato com o app do motorista.
+* **TOCTOU entre `removerPosicao`/`salvarPosicao`** (`driver.repository.ts`) — sem `WATCH`/transação atômica no Redis. Na pior hipótese, cria um "motorista fantasma" (aparece como online com posição desatualizada) até o TTL de posição expirar. Corrigir de verdade exigiria um script Lua (a forma mais segura, já que `infra/redis.ts` usa um client único compartilhado — `WATCH` exigiria conexão dedicada por transação) ou transação otimista no Redis — avaliado e deixado como limitação conhecida: a race é estreita, autolimitada por TTL, e a peça nova (Lua) traria mais risco de bug sutil do que o problema que resolve.
 * **10 rotas assíncronas em `main.ts` sem try/catch** (`/drivers`, `/trips`, `/geocoding/reverse`, `/simulacao/*`, etc.) — como o projeto usa Express 4 (não 5), uma exceção nelas (ex: MySQL/Redis fora do ar) não é encaminhada automaticamente pro middleware de erro; a request fica pendurada até o cliente estourar timeout, em vez de responder um erro. Robustez geral, sem relação com banda/memória.
 * **Pool do MySQL sem `queueLimit` explícito** (`infra/mysql.ts`) — o default da lib é fila ilimitada; sob carga sustentada acima do `connectionLimit`, requisições se enfileiram sem teto em vez de serem rejeitadas.
 * **CORS com `origin: '*'` junto de `credentials: true`** no Socket.IO (`main.ts`) — combinação que a spec de CORS considera inválida (navegadores ignoram `credentials` com wildcard); hoje inofensivo, mas inconsistente.
@@ -1629,7 +1649,7 @@ A desconexão também passou a validar o `socketClientId`.
 
 Isso evita que um `disconnect` atrasado de uma conexão antiga remova uma sessão mais nova do mesmo motorista.
 
-Duas janelas de corrida vizinhas a essa foram encontradas numa revisão posterior (`atualizarPosicao()` sem validar o dono do socket; TOCTOU entre `removerPosicao`/`salvarPosicao` sem `WATCH`) e ficaram documentadas como limitação conhecida em "Concorrência na desconexão" — ambas estreitas, autolimitadas por TTL, e fora do escopo do chamado original.
+Duas janelas de corrida vizinhas a essa foram encontradas numa revisão posterior. A primeira (`atualizarPosicao()` sem validar o dono do socket) foi corrigida do mesmo jeito — `atualizarPosicao()` agora também recebe e valida `socketClientId`. A segunda (TOCTOU entre `removerPosicao`/`salvarPosicao` sem `WATCH`) ficou documentada como limitação conhecida em "Concorrência na desconexão" — estreita, autolimitada por TTL, e corrigi-la de verdade exigiria uma peça nova (script Lua) fora do escopo do chamado original.
 
 ---
 

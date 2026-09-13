@@ -336,6 +336,7 @@ export class EventsGateway {
       const pos =
         await this.driverService.atualizarPosicao(
           dto,
+          client.id,
         );
 
       if (!pos) {
