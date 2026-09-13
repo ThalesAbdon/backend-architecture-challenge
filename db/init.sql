@@ -75,7 +75,9 @@ CREATE TABLE trips (
   canceled_by     VARCHAR(20) NULL,
   created_at      DATETIME NOT NULL,
   finished_at     DATETIME NULL,
-  UNIQUE KEY uq_trips_reference (reference)
+  UNIQUE KEY uq_trips_reference (reference),
+  KEY idx_trips_city_created (city_id, created_at),
+  KEY idx_trips_driver_created (driver_id, created_at)
 ) ENGINE = InnoDB;
 
 CREATE TABLE app_config (
@@ -95,7 +97,8 @@ CREATE TABLE trip_events (
   trip_id     BIGINT NOT NULL,
   event_type  VARCHAR(40) NOT NULL,
   payload     JSON NULL,
-  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_trip_events_trip (trip_id)
 ) ENGINE = InnoDB;
 
 -- ---------------------------------------------------------------------------

@@ -28,8 +28,20 @@ export class PainelService {
 
     for (let i = 0; i < ls.length; i++) {
       const l: any = ls[i];
-      if (l.chave === 'painel.janela') { this.janela = Number(l.valor) || this.janela; }
-      if (l.chave === 'painel.periodo') { this.intervaloMs = Number(l.valor) || this.intervaloMs; }
+
+      // Number(v) || default so falha pra "0"/NaN, nao pra negativo -- um
+      // valor negativo em app_config viraria um setInterval(fn, negativo),
+      // que o Node trata como ~0ms: o mesmo tipo de excesso de broadcast
+      // que o chamado original descreveu, so que causado por configuracao
+      // ruim em vez de bug de codigo. Por isso o teto/piso abaixo.
+      if (l.chave === 'painel.janela') {
+        const v = Number(l.valor);
+        if (Number.isFinite(v) && v > 0) this.janela = Math.min(v, 500);
+      }
+      if (l.chave === 'painel.periodo') {
+        const v = Number(l.valor);
+        if (Number.isFinite(v) && v > 0) this.intervaloMs = Math.max(v, 500);
+      }
       // 'painel.modo' foi removido em 2024 mas ainda pode vir do banco
       if (l.chave === 'painel.modo') { /* ignorado */ }
     }

@@ -33,6 +33,20 @@ const { TelemetryUploader } = require_('../vendor/fleet-telemetry-sdk/src/teleme
 
 const logger = new Logger('Main');
 
+/*
+ * Express 4 nao encaminha rejeicao de promise de um handler async pro
+ * middleware de erro. Sem isso, uma excecao (ex: NaN chegando numa query
+ * SQL) vira unhandled rejection e derruba o processo inteiro, nao so a
+ * request que causou o erro.
+ */
+function assincrono(
+  fn: (req: express.Request, res: express.Response) => Promise<void>,
+) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    fn(req, res).catch(next);
+  };
+}
+
 async function bootstrap() {
   await conectarMysql();
   await conectarRedis();
@@ -95,7 +109,7 @@ async function bootstrap() {
     res.json({ status: 'ok', versao: '2.4.1', uptime: process.uptime() });
   });
 
-  app.get('/drivers', async (req, res) => {
+  app.get('/drivers', assincrono(async (req, res) => {
     const cityId = num(req.query.cityId, 1);
     const limite = Math.min(num(req.query.limit, 50), 200);
 
@@ -103,7 +117,8 @@ async function bootstrap() {
     const ck = chave('drivers', cityId, limite);
     const cached = pegar(ck);
     if (cached && Date.now() - cached.em < 2000) {
-      return res.json(cached.body);
+      res.json(cached.body);
+      return;
     }
     const linhas = await consultar(
       'SELECT id_driver, name, city_id, category, vehicle_plate, vehicle_model, rating FROM drivers WHERE city_id = ? AND documents_ok = 1 ORDER BY id_driver LIMIT ?',
@@ -112,55 +127,61 @@ async function bootstrap() {
     const body = { cityId, total: linhas.length, drivers: linhas };
     guardar(ck, { em: Date.now(), body });
     res.json(body);
-  });
+  }));
 
-  app.get('/drivers/online', async (req, res) => {
+  app.get('/drivers/online', assincrono(async (req, res) => {
     const cityId = num(req.query.cityId, 1);
     const motoristas = await driverService.listarOnline(cityId);
     res.json({ cityId, total: motoristas.length, motoristas });
-  });
+  }));
 
-  app.get('/trips', async (req, res) => {
-    const cityId = Number(req.query.cityId ?? 1);
-    const limite = Math.min(Number(req.query.limit ?? 25), 100);
+  app.get('/trips', assincrono(async (req, res) => {
+    const cityId = num(req.query.cityId, 1);
+    const limite = Math.min(num(req.query.limit, 25), 100);
     res.json({ cityId, corridas: await tripService.listar(cityId, limite) });
-  });
+  }));
 
-  app.get('/trips/resumo', async (req, res) => {
-    res.json(await tripService.resumo(Number(req.query.cityId ?? 1)));
-  });
+  app.get('/trips/resumo', assincrono(async (req, res) => {
+    res.json(await tripService.resumo(num(req.query.cityId, 1)));
+  }));
 
-  app.get('/trips/:reference', async (req, res) => {
+  app.get('/trips/:reference', assincrono(async (req, res) => {
     const corrida = await tripService.detalhar(req.params.reference);
-    if (!corrida) return res.status(404).json({ erro: 'corrida não encontrada' });
+    if (!corrida) {
+      res.status(404).json({ erro: 'corrida não encontrada' });
+      return;
+    }
     res.json(corrida);
-  });
+  }));
 
-  app.get('/drivers/:id/trips', async (req, res) => {
-    const limite = Math.min(Number(req.query.limit ?? 20), 100);
-    res.json({ corridas: await tripService.historicoDoMotorista(Number(req.params.id), limite) });
-  });
+  app.get('/drivers/:id/trips', assincrono(async (req, res) => {
+    const limite = Math.min(num(req.query.limit, 20), 100);
+    res.json({ corridas: await tripService.historicoDoMotorista(num(req.params.id, 0), limite) });
+  }));
 
   app.post('/pricing/estimate', (req, res) => {
     const estimativa = pricingService.estimar({
-      cidade: Number(req.body?.cidade ?? 1),
+      cidade: num(req.body?.cidade, 1),
       categoria: String(req.body?.categoria ?? 'standard'),
       zona: req.body?.zona,
-      distanciaM: Number(req.body?.distanciaM ?? 3000),
-      duracaoS: Number(req.body?.duracaoS ?? 600),
+      distanciaM: num(req.body?.distanciaM, 3000),
+      duracaoS: num(req.body?.duracaoS, 600),
       bandeira: req.body?.bandeira,
     });
-    if (!estimativa) return res.status(422).json({ erro: 'sem faixa tarifária aplicável' });
+    if (!estimativa) {
+      res.status(422).json({ erro: 'sem faixa tarifária aplicável' });
+      return;
+    }
     res.json(estimativa);
   });
 
-  app.get('/geocoding/reverse', async (req, res) => {
+  app.get('/geocoding/reverse', assincrono(async (req, res) => {
     const endereco = await geocodingService.reverso(
-      Number(req.query.lat ?? -21.3767),
-      Number(req.query.lng ?? -46.5253),
+      num(req.query.lat, -21.3767),
+      num(req.query.lng, -46.5253),
     );
     res.json({ endereco });
-  });
+  }));
 
   app.get('/telemetry', (_req, res) => {
     res.json({
@@ -170,18 +191,27 @@ async function bootstrap() {
     });
   });
 
-  app.get('/simulacao/estado', async (_req, res) => {
+  app.get('/simulacao/estado', assincrono(async (_req, res) => {
     res.json(await simulacaoService.estado());
-  });
+  }));
 
-  app.post('/simulacao/iniciar', async (req, res) => {
-    const cidade = Number(req.body?.cidade ?? config.frota.cidadePadrao);
-    const motoristas = Number(req.body?.motoristas ?? config.frota.tamanho);
+  app.post('/simulacao/iniciar', assincrono(async (req, res) => {
+    const cidade = num(req.body?.cidade, config.frota.cidadePadrao);
+    const motoristas = num(req.body?.motoristas, config.frota.tamanho);
     res.json(await simulacaoService.iniciar(cidade, motoristas));
-  });
+  }));
 
-  app.post('/simulacao/parar', async (_req, res) => {
+  app.post('/simulacao/parar', assincrono(async (_req, res) => {
     res.json(await simulacaoService.parar());
+  }));
+
+  // Precisa vir depois de todas as rotas: middleware de erro do Express
+  // (assinatura de 4 parametros). Sem isso, um erro que passa por
+  // assincrono() ainda derrubaria o processo -- agora vira uma resposta
+  // 500 normal, e o processo continua de pe pras outras requisicoes.
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    logger.error('erro nao tratado numa rota', err);
+    res.status(500).json({ erro: 'erro interno' });
   });
 
   servidor.listen(config.port, () => {

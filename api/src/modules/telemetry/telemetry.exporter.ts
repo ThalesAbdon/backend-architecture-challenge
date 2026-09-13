@@ -68,7 +68,7 @@ export class TelemetryExporter {
     // drena o que ja passou da janela de reordenacao
     this.fila808.批量出队(this.loteMax);
 
-    // Empacota com o codec do SDK: ~15x sobre o JSON equivalente.
+    // Empacota com o codec do SDK: ~10x sobre o JSON equivalente (medido).
     const amostras = lote.map((a) => ({
       driverId: a.driverId, lat: a.lat, lng: a.lng, speed: a.speed, at: a.em,
     }));

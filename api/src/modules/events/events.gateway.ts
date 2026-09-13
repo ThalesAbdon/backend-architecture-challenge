@@ -370,7 +370,7 @@ export class EventsGateway {
       );
     } catch (e) {
       this.logger.error(
-        `erro ao atualizar posicao do motorista ${dto.driverId}`,
+        `erro ao atualizar posicao do motorista ${Number(dto.driverId)}`,
         e,
       );
     }
