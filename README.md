@@ -197,6 +197,48 @@ A separação permite:
 
 ---
 
+# Vazamento de memória em `TelemetryService`
+
+Durante a revisão desse mesmo módulo (Telemetria), foi encontrado um vazamento de memória sem relação com o chamado original, mas real: `TelemetryService.acompanhar(client)` cria um `setInterval` a cada conexão de socket e nunca o cancela.
+
+```typescript
+acompanhar(client: Socket): void {
+  const q: any = client.handshake.query;
+  let d = null;
+  if (q.driverId) { d = Number(q.driverId); }
+
+  setInterval(() => {
+    this.amostras.push({
+      socketId: client.id,
+      driverId: d,
+      em: Date.now(),
+      memoriaMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      rooms: client.rooms.size,
+    });
+  }, this.intervaloMs);
+}
+```
+
+`acompanhar()` é chamado para **toda** conexão que chega no gateway (`this.telemetria.acompanhar(client)`, logo no início de `aoConectar`, antes de qualquer verificação de `driverId`/`userId`), e o retorno de `setInterval` nunca era guardado nem cancelado. Resultado: todo socket que já passou pelo servidor desde o boot continuava com um timer rodando pra sempre — referenciando o `client` (o que também impede o socket de ser coletado pelo GC) e empilhando amostras num array (`this.amostras`) que nunca é limpo. Em produção, com motoristas reconectando o tempo todo, isso cresce sem limite enquanto o processo estiver de pé.
+
+### Correção
+
+Guardar a referência do timer e cancelá-lo quando o socket desconecta:
+
+```typescript
+const timer = setInterval(() => {
+  this.amostras.push({ /* ... */ });
+}, this.intervaloMs);
+
+// Sem isso o interval sobrevive ao socket: toda conexão que já passou
+// pelo servidor fica rodando pra sempre, mesmo após o disconnect.
+client.once('disconnect', () => clearInterval(timer));
+```
+
+Não há mudança de contrato: `relatorio()` e o payload de `/telemetry` continuam iguais, só o ciclo de vida do timer passa a acompanhar o do socket.
+
+---
+
 # Etapa 2 — Gargalo na fila JT808
 
 ## Problema identificado
@@ -1114,6 +1156,43 @@ Ou seja: depois da correção do `painel.service.ts`, `emitEvent()`/`emitAll()`/
 
 ---
 
+# Validação end-to-end pela bancada visual
+
+As validações anteriores confirmaram o roteamento por sala lendo o código-fonte e testando via socket cru (dois clientes de socket.io conectados diretamente na API). Para fechar, foi feito também um teste dirigindo a aplicação real — navegador headless (Playwright/Chromium) apontado para `http://localhost:8080`, clicando no botão **Iniciar teste** de verdade, com a stack inteira do `docker compose` (incluindo a frota de fundo) em execução.
+
+Um detalhe mudou a forma do teste: lendo `api/src/sim/fleet.ts`, a frota de fundo **não** fica inteiramente na cidade padrão (`FLEET_CITY=1`) — `FLEET_SPREAD` (0.35 por padrão) manda ~35% dos motoristas simulados para as "praças vizinhas" `[2, 3]`. Ou seja, neste ambiente já existe tráfego orgânico de mais de uma cidade o tempo todo, não só durante o teste da bancada.
+
+Isso permitiu um teste mais forte do que o socket cru original: dentro da própria página (reaproveitando o `io()` já carregado por ela via `/socket.io/socket.io.js`, passando pelo mesmo proxy nginx e pelo mesmo servidor), foi aberta uma conexão "espiã" na sala da cidade `777` — uma cidade que não existe em nenhuma simulação do ambiente. Enquanto isso, a bancada rodou o teste real (6 aparelhos, cidade 1) com a frota de fundo já ativa (cidades 1, 2 e 3 misturadas):
+
+* console do navegador: sem erros;
+* teste da bancada concluiu normalmente (`6 / 6` corridas);
+* a sala `777` não recebeu **nenhum** evento (`driver.positions` ou `city.summary`) durante toda a execução — mesmo com tráfego real e simultâneo de três cidades diferentes rodando no mesmo servidor.
+
+```text
+--- SPY (cidade 777) recebeu durante o teste da cidade 1 ---
+[]
+OK: espiao da cidade 777 nao recebeu NENHUM evento do trafego real
+```
+
+## Regressão do vazamento de memória em `TelemetryService`
+
+Depois de corrigir o `clearInterval` (ver "Vazamento de memória em `TelemetryService`", na Etapa 1), o container `api` foi reconstruído e testado ao vivo contra o `/telemetry`:
+
+1. 15 sockets conectados de uma vez → `amostras` cresce em 15 após um ciclo do timer (`delta = 15`, 1 amostra por socket).
+2. Os 15 sockets são desconectados.
+3. Espera-se mais um ciclo completo do timer → `amostras` **não** cresce de novo (`delta = 0`).
+
+```text
+amostras depois de conectar + 1 ciclo: 15 (delta=15)
+todos os sockets desconectados
+amostras 1 ciclo apos disconnect: 15 (delta=0)
+OK: amostras pararam de crescer no ritmo de N apos disconnect -> clearInterval funcionando
+```
+
+Antes da correção, o passo 3 continuaria somando +15 a cada ciclo, indefinidamente, mesmo com todos os sockets já desconectados — o que caracteriza o vazamento.
+
+---
+
 # 📊 Observabilidade
 
 Durante a validação do ambiente foram utilizados os endpoints existentes.
@@ -1207,6 +1286,7 @@ api/src/modules/driver/driver.types.ts
 api/src/modules/telemetry/telemetry.exporter.ts
 api/src/modules/telemetry/telemetry.sink.ts
 api/src/modules/telemetry/telemetry.types.ts
+api/src/modules/telemetry/telemetry.service.ts
 
 api/vendor/jt808-telematics/批量上报队列.js
 api/vendor/jt808-telematics/package.json
@@ -1295,6 +1375,8 @@ A investigação identificou problemas em diferentes partes do sistema e cada um
 O fluxo de telemetria foi desacoplado do `EventsGateway` através da introdução de um `TelemetrySink`.
 
 Isso separa a responsabilidade de coleta da responsabilidade de exportação.
+
+Na mesma área foi encontrado e corrigido um vazamento de memória real, sem relação com o chamado: `TelemetryService.acompanhar()` criava um `setInterval` por socket conectado e nunca dava `clearInterval`, então todo socket que já havia passado pelo servidor continuava com um timer rodando pra sempre, mesmo após o disconnect. A correção guarda a referência do timer e o cancela no evento `disconnect` do próprio socket — testado ao vivo (conectando e desconectando sockets reais e observando `/telemetry`), sem mudança de contrato.
 
 ---
 
