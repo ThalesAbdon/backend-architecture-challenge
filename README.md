@@ -992,6 +992,33 @@ Rodado contra o `PricingService` real (fora e dentro do container, via `POST /pr
 
 `vigencia` agora reporta setembro (a faixa correta), e o preço bate com a conta manual (`R$ 24,44`).
 
+### Correção da correção — o filtro por `[vigenciaInicio, vigenciaFim]` tinha um buraco
+
+Uma revisão adversarial posterior, feita especificamente para desconfiar deste fix, achou uma regressão real que ele mesmo introduziu: todo `vigenciaFim` em `tarifas.json` está fixo no dia **28** do mês (não no último dia real), enquanto o próximo `vigenciaInicio` é sempre dia 01 do mês seguinte. Em meses com 29, 30 ou 31 dias, isso deixa 1 a 3 dias sem **nenhuma** faixa cobrindo — `estimar()` passou a retornar `null` (falha do serviço, não cobrança errada) nesses dias, em vez do bug original. E, pior: a tabela só publica até setembro/2026 — a partir de 29/09 (e por todo mês seguinte, indefinidamente, já que não existe faixa de outubro), o serviço de precificação pararia de funcionar por completo.
+
+Testado com as datas exatas apontadas por essa revisão (`2026-01-29`, `2026-01-30`, `2026-01-31`, `2026-03-30`, `2026-08-31`, `2026-09-29`, `2026-09-30`, `2026-10-01`, `2026-12-25`): todas retornavam `null` com o filtro `[inicio, fim]`.
+
+**Correção**: em vez de exigir que a data esteja dentro de `[vigenciaInicio, vigenciaFim]`, a faixa escolhida passou a ser a de **`vigenciaInicio` mais recente que já começou** — sem olhar `vigenciaFim` (que é o dado com problema). Uma faixa continua valendo até ser substituída por uma mais nova, nunca "expira" sem substituta:
+
+```typescript
+const hojeStr = hoje();
+const jaComecou = (f: FaixaTarifaria) => f.vigenciaInicio <= hojeStr;
+
+const maisRecente = (lista: FaixaTarifaria[]): FaixaTarifaria | undefined =>
+  lista
+    .filter(jaComecou)
+    .reduce<FaixaTarifaria | undefined>(
+      (melhor, f) => (!melhor || f.vigenciaInicio > melhor.vigenciaInicio ? f : melhor),
+      undefined,
+    );
+
+const faixa =
+  maisRecente(tabela.filter((f) => f.cidade === entrada.cidade && f.categoria === entrada.categoria && f.zona === (entrada.zona ?? 'centro') && f.bandeira === (entrada.bandeira ?? 1)))
+  ?? maisRecente(tabela.filter((f) => f.cidade === entrada.cidade && f.categoria === entrada.categoria));
+```
+
+**Validado**: rodei as mesmas 9 datas de gap/esgotamento contra essa lógica (isolada, sem depender do relógio real da máquina) — todas agora resolvem pra uma faixa real (as datas de gap caem na faixa do mês corrente; as datas depois de setembro caem na própria faixa de setembro, a mais recente disponível, em vez de falhar). `POST /pricing/estimate` continua retornando `R$ 24,44`/vigência setembro para a data real de hoje. `npx tsc --noEmit` limpo.
+
 ### Achado secundário, não corrigido
 
 A mesma revisão notou que `tarifas.json` também carrega um bloco `multiplicadores` (chuva, pico manhã/tarde, madrugada, evento) em toda faixa — dado morto, nunca lido pelo código. Não é um bug (nada está incorreto por causa disso), só uma feature de precificação dinâmica que parece ter sido planejada mas nunca implementada. Deixado como está, fora do escopo desta correção.
