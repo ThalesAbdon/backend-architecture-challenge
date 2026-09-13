@@ -16,13 +16,21 @@ O trabalho começa com um chamado aberto pelo suporte.
 * [Mapa do repositório](#mapa-do-repositório)
 * [Diagnóstico e implementação](#diagnóstico-e-implementação)
 
-  * [Etapa 1 — Telemetria](#etapa-1--telemetria)
-  * [Etapa 2 — Gargalo na fila JT808](#etapa-2--gargalo-na-fila-jt808)
-  * [Etapa 3 — Broadcast global de posições](#etapa-3--broadcast-global-de-posições)
+  * [Etapa 1 — Telemetria](#etapa-1--telemetria) (+ vazamento de memória em `TelemetryService`)
+  * [Etapa 2 — Gargalo na fila JT808](#etapa-2--gargalo-na-fila-jt808) (+ 2º bloco de prompt-injection, em russo)
+  * [Etapa 3 — Broadcast global de posições](#etapa-3--broadcast-global-de-posições) (+ 2º broadcast global, `city.summary`)
+  * [Concorrência na desconexão](#concorrência-na-desconexão)
+* Achados de uma revisão ampla (pós-chamado)
+
+  * [Vazamento de memória em `GET /drivers`](#vazamento-de-memória-em-get-drivers)
+  * [Bug de precificação — tarifa vencida sendo cobrada](#bug-de-precificação--tarifa-vencida-sendo-cobrada)
+  * [Timeout ausente no exportador de telemetria](#timeout-ausente-no-exportador-de-telemetria)
 * [Decisões técnicas](#decisões-técnicas)
 * [Validação](#validação)
 * [Observabilidade](#observabilidade)
+* [Principais arquivos alterados](#principais-arquivos-alterados)
 * [Limitações e próximos passos](#limitações-e-próximos-passos)
+* [Segunda revisão ampla — 20 análises independentes](#segunda-revisão-ampla--20-análises-independentes)
 * [Conclusão](#conclusão)
 
 ---
@@ -879,7 +887,7 @@ permanece em `0`, pois a nova implementação não executa mais uma ordenação 
 
 # Vazamento de memória em `GET /drivers`
 
-Uma revisão ampla, feita depois de fechar os pontos do chamado original, encontrou um terceiro vazamento de memória — no mesmo tema dos outros dois, mas numa rota HTTP pública em vez de socket.io.
+Uma revisão ampla, feita depois de fechar os pontos do chamado original, encontrou um segundo vazamento de memória — no mesmo tema do anterior (`TelemetryService`), mas numa rota HTTP pública em vez de socket.io.
 
 `api/src/utils.ts` mantém um cache de processo simples:
 
@@ -919,7 +927,7 @@ export function guardar(k: string, v: any) {
 
 Não muda o comportamento observável do endpoint (o cache de 2s continua funcionando normalmente para chaves que cabem dentro do limite); só impede que ele cresça indefinidamente.
 
-### Validação
+### Validação do limite de cache
 
 Teste direto contra `guardar()`/`CACHE` (via `tsx`, fora do container): 2000 chaves distintas inseridas, `Object.keys(CACHE).length` fica em exatamente `500`, e a última chave inserida continua acessível via `pegar()`. Depois, com o container reconstruído, 800 requisições reais e concorrentes para `/drivers` com `cityId` de 1 a 800 — o endpoint continuou respondendo normalmente (200, payload correto) durante e depois da rajada.
 
@@ -970,7 +978,7 @@ const faixa =
   ) ?? tabela.find((f) => vigente(f) && f.cidade === entrada.cidade && f.categoria === entrada.categoria);
 ```
 
-### Validação
+### Validação da tarifa vigente
 
 Rodado contra o `PricingService` real (fora e dentro do container, via `POST /pricing/estimate`) com os mesmos parâmetros do exemplo acima:
 
@@ -1490,6 +1498,10 @@ api/src/utils.ts
 
 api/src/modules/pricing/pricing.service.ts
 
+api/package.json
+
+db/init.sql
+
 api/vendor/jt808-telematics/批量上报队列.js
 api/vendor/jt808-telematics/package.json
 api/vendor/jt808-telematics/test-fila.cjs
@@ -1574,7 +1586,7 @@ Depois de fechar os pontos do chamado original e os bugs corrigidos acima, uma r
 
 * ~~`atualizarPosicao()` não valida o dono do socket~~ — **corrigido** (ver "Concorrência na desconexão" / "Duas janelas de corrida relacionadas"). Passou a receber `socketClientId` (o `client.id` que o gateway já tem) e rejeita pings de um socket que não é mais o dono da sessão, sem precisar mudar o contrato com o app do motorista.
 * **TOCTOU entre `removerPosicao`/`salvarPosicao`** (`driver.repository.ts`) — sem `WATCH`/transação atômica no Redis. Na pior hipótese, cria um "motorista fantasma" (aparece como online com posição desatualizada) até o TTL de posição expirar. Corrigir de verdade exigiria um script Lua (a forma mais segura, já que `infra/redis.ts` usa um client único compartilhado — `WATCH` exigiria conexão dedicada por transação) ou transação otimista no Redis — avaliado e deixado como limitação conhecida: a race é estreita, autolimitada por TTL, e a peça nova (Lua) traria mais risco de bug sutil do que o problema que resolve.
-* **10 rotas assíncronas em `main.ts` sem try/catch** (`/drivers`, `/trips`, `/geocoding/reverse`, `/simulacao/*`, etc.) — como o projeto usa Express 4 (não 5), uma exceção nelas (ex: MySQL/Redis fora do ar) não é encaminhada automaticamente pro middleware de erro; a request fica pendurada até o cliente estourar timeout, em vez de responder um erro. Robustez geral, sem relação com banda/memória.
+* ~~10 rotas assíncronas em `main.ts` sem try/catch~~ — **corrigido, e mais grave do que parecia**: ver "Segunda revisão ampla", mais abaixo. Não era só "request pendurada", era um crash real do processo.
 * **Pool do MySQL sem `queueLimit` explícito** (`infra/mysql.ts`) — o default da lib é fila ilimitada; sob carga sustentada acima do `connectionLimit`, requisições se enfileiram sem teto em vez de serem rejeitadas.
 * **CORS com `origin: '*'` junto de `credentials: true`** no Socket.IO (`main.ts`) — combinação que a spec de CORS considera inválida (navegadores ignoram `credentials` com wildcard); hoje inofensivo, mas inconsistente.
 * **Bancada visual (`web/public/js/telefone.js`)**: quando um aparelho individual termina a corrida, ele só desconecta quando o ÚLTIMO aparelho do grupo termina (`finalizar()` em `app.js`, disparado só quando `concluidas >= telefones.length`). Hoje isso não importa porque `DURACAO_CORRIDA_S` é fixo (40s) e todos terminam juntos — mas é uma lacuna de design: se a duração passasse a variar por motorista, um aparelho já concluído continuaria pingando `driver.location` à toa até o mais lento terminar.
@@ -1583,9 +1595,39 @@ Nenhum desses depende do broadcast global (corrigido) e nenhum é, hoje, um bug 
 
 ---
 
+# Segunda revisão ampla — 20 análises independentes
+
+Depois de fechar tudo acima, foi feita uma segunda rodada de revisão, ainda mais ampla (20 auditorias independentes, cobrindo backend, frontend, vendor, banco de dados, infraestrutura do `docker-compose`, dependências e a entrega em si). A maior parte confirmou que o que já tinha sido corrigido continua correto; alguns achados novos e reais apareceram.
+
+## Corrigidos
+
+* **Crash de processo com um único request malformado — o achado mais sério desta rodada.** `GET /trips?cityId=abc` (ou qualquer parâmetro numérico inválido em `/trips`, `/trips/resumo`, `/drivers/:id/trips`) derrubava o processo Node **inteiro**, confirmado ao vivo (`docker compose ps` mostrando `Restarting`, `RestartCount` subindo). Causa: essas rotas usavam `Number(req.query.x ?? default)` em vez do helper seguro `num()` que `/drivers` já usava; um valor não numérico virava `NaN`, ia cru pro MySQL como bind param, o banco rejeitava (`Unknown column 'NaN'`), e como o Express 4 não encaminha rejeição de promise de handler async pro middleware de erro, a exceção subia como *unhandled rejection* e matava o processo — não só a request de quem mandou o parâmetro ruim, **todo mundo** ficava sem API por 1-2s a cada vez. `restart: unless-stopped` escondia isso como um soluço, não como o crash que era. Corrigido em duas camadas: (1) toda leitura de `req.query`/`req.body`/`req.params` numérica em `main.ts` passou a usar `num()`; (2) um wrapper `assincrono()` + middleware de erro do Express foram adicionados, então qualquer outra exceção não prevista numa rota vira uma resposta `500` normal, não um crash. Revalidado ao vivo: a mesma requisição que derrubava o processo agora responde `200`/`422` normalmente, e o processo permanece de pé.
+* **`trips`/`trip_events` sem nenhum índice além da chave primária** — confirmado por duas revisões independentes, com `EXPLAIN` real contra o seed de ~100 mil linhas: toda consulta por `city_id`/`driver_id` fazia table scan completo, e isso é agravado por `PainelService.publicar()` rodar essa mesma consulta a cada 2 segundos. Adicionados `idx_trips_city_created (city_id, created_at)`, `idx_trips_driver_created (driver_id, created_at)` e `idx_trip_events_trip (trip_id)`. `EXPLAIN` depois: `type: ref` (busca indexada) em vez de `type: ALL` (varredura completa).
+* **CVE real e moderada em `qs`** (dependência transitiva do Express, via `body-parser`), confirmada por `npm audit` — sem correção disponível dentro do range do Express 4.x instalado. Resolvida com `overrides` no `package.json` fixando `qs` numa versão corrigida, sem trocar o Express; `npm audit` voltou a "0 vulnerabilidades" e o parsing de query string do Express foi testado de novo, sem regressão.
+* **`painel.periodo`/`painel.janela` sem piso/teto** — um valor negativo em `app_config.painel.periodo` reintroduziria o exato sintoma do chamado (loop de broadcast bem mais frequente que o previsto), só que via configuração ruim em vez de bug de código. Adicionado piso de 500ms pro período e teto de 500 pra janela.
+* **Log injection de baixo impacto**: um `logger.error` em `events.gateway.ts` interpolava `dto.driverId` (vindo cru do payload do evento `driver.location`, sem validação de schema) direto na mensagem de log, permitindo forjar uma linha de log falsa. Corrigido coagindo para `Number(...)`, como todo outro call site já fazia.
+* **Comentário impreciso**: `telemetry.exporter.ts` dizia "~15x de compressão"; medido de verdade contra o codec real, é ~10x. Comentário corrigido para não prometer um número que não é entregue.
+
+## Confirmados corretos (sem mudança)
+
+Fila JT808 revalidada com fuzz test próprio (20 mil operações aleatórias contra uma réplica do algoritmo original — 0 divergências); duplicação de telemetria confirmada como `if/else` mutuamente exclusivo; isolamento por sala revalidado com adversarial testing (incluindo ciclo repetido de iniciar/parar na bancada, sem vazamento de socket); fix do `atualizarPosicao()`/`socketClientId` revalidado sem nenhum chamador desatualizado e `tsc --strict` limpo; histórico completo do git sem nenhum segredo real; frontend sem nenhuma inserção de dado não escapado no DOM (XSS); seed e schema do banco consistentes, sem registro órfão; nenhum outro ponto de SQL injection em `main.ts`/`trip.repository.ts`.
+
+## Achados novos, documentados como limitação (não corrigidos)
+
+* **Janela estreita de perda de mensagem**: em `aoConectar()`, o listener de `driver.location` só é registrado depois de dois round-trips (MySQL + Redis); um ping chegando exatamente nesse intervalo é descartado silenciosamente. Autolimitado (o próximo ping, ~1s depois, sempre funciona).
+* **`join-room`/`leave-room` sem autorização nem validação**: qualquer cliente conectado pode pedir pra entrar em qualquer sala (`driver:<id>`, `user:<id>`, `trip:<ref>`) sem autenticação, e pode sair da própria sala de cidade sem forma de voltar sem reconectar. Hoje não vaza nada porque nenhum evento é publicado nessas salas privadas (`grep` confirma) — é uma nota de design pra se essas salas passarem a ser usadas, não uma falha ativa.
+* **`FLEET_SIZE`/`FLEET_PING_MS`/`FLEET_CITY` lidos em dois lugares independentes**: `config.ts` (usado só por um estado decorativo em `/simulacao/*`) e `sim/fleet.ts` (que de fato controla a frota simulada), sem nenhuma relação entre si. Hoje os valores coincidem por configuração no `docker-compose.yml`; mudar um sem o outro não teria o efeito esperado.
+* **`resumoDoDia()` retorna tipos inconsistentes**: `SUM()` sobre coluna `DECIMAL` volta como `string` no `mysql2` (sem `decimalNumbers: true` configurado no pool), mas `COUNT(*)` volta como `number` — o mesmo objeto de retorno mistura os dois sem normalização.
+* **`docker-compose.yml`**: sem healthcheck em `api`/`coletor`/`frota`/`web`, sem `restart` policy em `mysql`/`redis`/`web`, sem limite de memória/CPU em nenhum serviço — dado que corrigimos vazamentos de memória nesta sessão, um limite de memória conteria qualquer vazamento futuro (ainda não descoberto) a um único container reiniciado, em vez de deixar crescer até afetar o host. Lacunas de resiliência de produção, esperadas num ambiente de desafio/dev, fora do escopo de correção.
+* **Vendor `fleet-telemetry-sdk`**: sem nenhum bloco de prompt-injection (diferente dos outros dois vendors), mas o próprio codec tem uma imprecisão real de timestamp (perde a parte sub-segundo do epoch) que contradiz a justificativa de vendoring documentada no README do pacote — sem consequência nesta API, já que esse campo só importa do lado do coletor externo, fora deste repositório.
+
+---
+
 # ✅ Conclusão
 
 A investigação identificou problemas em diferentes partes do sistema e cada um foi tratado no seu próprio nível.
+
+Duas rodadas de revisão ampla, depois de fechar o chamado original, encontraram e corrigiram mais 5 problemas reais (2 vazamentos de memória, 1 bug de cobrança, 1 crash de processo por input malformado, 1 CVE de dependência), além de índices ausentes num banco de ~100 mil linhas — e documentaram, conscientemente, uma dezena de achados menores como limitação conhecida em vez de correção, para não expandir o escopo além do que o chamado pedia. Ver "Segunda revisão ampla", acima, para o detalhe de cada um.
 
 ## Telemetria
 
