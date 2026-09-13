@@ -777,6 +777,15 @@ motorista X conectado
 
 sem que a sessão nova fosse indevidamente apagada.
 
+## Duas janelas de corrida relacionadas, identificadas mas não corrigidas
+
+Numa revisão posterior, mais ampla, foram encontradas duas janelas de corrida vizinhas a essa — ambas reais, ambas estreitas e autolimitadas por TTL, e por isso deixadas como limitação conhecida em vez de correção:
+
+1. **`atualizarPosicao()` não valida o dono do socket.** A proteção acima (`removerPosicao`) só existe no caminho de *desconexão*. `atualizarPosicao(dto)` (`driver.service.ts`) busca a posição só por `driverId` e nunca compara `socketClientId` — então, na janela em que um socket antigo ainda não desconectou de fato mas já foi substituído por uma reconexão, um ping tardio do socket antigo ainda é aceito e atualiza a posição (e reseta o TTL). Corrigir isso exigiria propagar `socketClientId` também no fluxo de `driver.location`, hoje só usado no fluxo de conexão/desconexão.
+2. **TOCTOU entre `removerPosicao` e `salvarPosicao`.** Nenhum dos dois usa `WATCH`/transação otimista do Redis — ambos fazem `GET` e decidem em JS antes de escrever. Um `disconnect` e um ping tardio do mesmo `driverId` intercalados podem, em teoria, fazer uma sessão recém-removida "ressuscitar" por um instante.
+
+Nenhuma das duas depende do broadcast global (já corrigido) e ambas se autocorrigem pelo TTL de posição em segundos — não ficam presas de forma permanente. Ficam registradas aqui em vez de corrigidas porque a correção completa exigiria mudar o contrato de `driver.location` (adicionar `socketClientId` ao payload que o app do motorista já envia), o que está fora do escopo do chamado original.
+
 ---
 
 # Compatibilidade
@@ -810,6 +819,54 @@ A estatística:
 ```
 
 permanece em `0`, pois a nova implementação não executa mais uma ordenação global após cada inserção.
+
+---
+
+# Vazamento de memória em `GET /drivers`
+
+Uma revisão ampla, feita depois de fechar os pontos do chamado original, encontrou um terceiro vazamento de memória — no mesmo tema dos outros dois, mas numa rota HTTP pública em vez de socket.io.
+
+`api/src/utils.ts` mantém um cache de processo simples:
+
+```typescript
+export const CACHE: Record<string, any> = {};
+
+export function guardar(k: string, v: any) { CACHE[k] = v; }
+```
+
+Ele é usado em `GET /drivers` (`main.ts`) pra evitar bater no MySQL a cada request:
+
+```typescript
+const cityId = num(req.query.cityId, 1);
+const limite = Math.min(num(req.query.limit, 50), 200);
+const ck = chave('drivers', cityId, limite);
+// ...
+guardar(ck, { em: Date.now(), body });
+```
+
+A chave do cache é montada a partir de `cityId` e `limite`, os dois vindos direto da query string, sem validação de faixa. Como o endpoint é público e sem autenticação, qualquer chamada com um `cityId` diferente (mesmo um número inválido, negativo ou decimal) cria uma entrada nova e permanente em `CACHE` — que nunca é removida. Um cliente variando `cityId` faz esse objeto crescer sem limite enquanto o processo estiver de pé.
+
+### Correção
+
+`guardar()` passou a limitar o cache a um número fixo de entradas (`LIMITE_CACHE = 500`), removendo a mais antiga quando o limite é atingido:
+
+```typescript
+export function guardar(k: string, v: any) {
+  if (!(k in CACHE)) {
+    const chaves = Object.keys(CACHE);
+    if (chaves.length >= LIMITE_CACHE) {
+      delete CACHE[chaves[0]];
+    }
+  }
+  CACHE[k] = v;
+}
+```
+
+Não muda o comportamento observável do endpoint (o cache de 2s continua funcionando normalmente para chaves que cabem dentro do limite); só impede que ele cresça indefinidamente.
+
+### Validação
+
+Teste direto contra `guardar()`/`CACHE` (via `tsx`, fora do container): 2000 chaves distintas inseridas, `Object.keys(CACHE).length` fica em exatamente `500`, e a última chave inserida continua acessível via `pegar()`. Depois, com o container reconstruído, 800 requisições reais e concorrentes para `/drivers` com `cityId` de 1 a 800 — o endpoint continuou respondendo normalmente (200, payload correto) durante e depois da rajada.
 
 ---
 
@@ -1288,6 +1345,8 @@ api/src/modules/telemetry/telemetry.sink.ts
 api/src/modules/telemetry/telemetry.types.ts
 api/src/modules/telemetry/telemetry.service.ts
 
+api/src/utils.ts
+
 api/vendor/jt808-telematics/批量上报队列.js
 api/vendor/jt808-telematics/package.json
 api/vendor/jt808-telematics/test-fila.cjs
@@ -1431,6 +1490,21 @@ O mesmo bug apareceu uma segunda vez em `PainelService` (evento `city.summary`, 
 A desconexão também passou a validar o `socketClientId`.
 
 Isso evita que um `disconnect` atrasado de uma conexão antiga remova uma sessão mais nova do mesmo motorista.
+
+Duas janelas de corrida vizinhas a essa foram encontradas numa revisão posterior (`atualizarPosicao()` sem validar o dono do socket; TOCTOU entre `removerPosicao`/`salvarPosicao` sem `WATCH`) e ficaram documentadas como limitação conhecida em "Concorrência na desconexão" — ambas estreitas, autolimitadas por TTL, e fora do escopo do chamado original.
+
+---
+
+## Vazamentos de memória
+
+Dois vazamentos de memória de processo foram encontrados e corrigidos, ambos com o mesmo formato — algo criado por conexão/requisição e nunca liberado:
+
+| Onde | O que vazava | Correção |
+| --- | --- | --- |
+| `TelemetryService.acompanhar()` | um `setInterval` por socket, nunca cancelado | `clearInterval` no `disconnect` do próprio socket |
+| `GET /drivers` (`utils.ts`) | uma entrada de cache por combinação de `cityId`/`limit`, sem limite | `CACHE` limitado a 500 entradas, com remoção da mais antiga |
+
+Nenhum dos dois tem relação com o chamado original (banda/broadcast global) — foram encontrados numa revisão mais ampla, feita depois de fechar os pontos do chamado.
 
 ---
 
