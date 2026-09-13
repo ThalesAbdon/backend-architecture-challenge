@@ -12,6 +12,7 @@ import { conectarRedis } from './infra/redis.js';
 
 import { DriverRepository } from './modules/driver/driver.repository.js';
 import { DriverService } from './modules/driver/driver.service.js';
+import { paraExibicaoPublica } from './modules/driver/driver.types.js';
 import { EventsEmitter } from './modules/events/events.emitter.js';
 import { EventsRoomService } from './modules/events/events.rooms.js';
 import { EventsGateway } from './modules/events/events.gateway.js';
@@ -132,7 +133,7 @@ async function bootstrap() {
   app.get('/drivers/online', assincrono(async (req, res) => {
     const cityId = num(req.query.cityId, 1);
     const motoristas = await driverService.listarOnline(cityId);
-    res.json({ cityId, total: motoristas.length, motoristas });
+    res.json({ cityId, total: motoristas.length, motoristas: motoristas.map(paraExibicaoPublica) });
   }));
 
   app.get('/trips', assincrono(async (req, res) => {

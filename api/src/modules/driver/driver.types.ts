@@ -71,6 +71,62 @@ export interface MotoristaPosicao {
   };
 }
 
+/**
+ * Projeção pública de `MotoristaPosicao` — o que pode sair da API (broadcast
+ * de socket.io ou resposta HTTP) sem vazar dado sensível.
+ *
+ * `MotoristaPosicao.cadastro` carrega CPF, e-mail, telefone, conta bancária
+ * e saldo de carteira; `socketClientId` é detalhe interno de sessão. Nenhum
+ * consumidor real (a bancada só lê driverId/latitude/longitude/heading)
+ * precisa de nada disso — só existe pra montar o card do motorista no app
+ * do passageiro, que precisa apenas de nome, avaliação e veículo.
+ */
+export interface MotoristaPosicaoPublica {
+  driverId: number;
+  cityId: number;
+
+  latitude: number;
+  longitude: number;
+
+  heading: number;
+  speed: number;
+  status: string;
+  accuracy: number;
+
+  nome: string;
+  rating: number;
+
+  veiculo: {
+    plate: string;
+    model: string;
+    brand: string;
+    color: string;
+    year: number;
+  };
+}
+
+export function paraExibicaoPublica(
+  p: MotoristaPosicao,
+): MotoristaPosicaoPublica {
+  return {
+    driverId: p.driverId,
+    cityId: p.cityId,
+
+    latitude: p.latitude,
+    longitude: p.longitude,
+
+    heading: p.heading,
+    speed: p.speed,
+    status: p.status,
+    accuracy: p.accuracy,
+
+    nome: p.cadastro.name,
+    rating: p.cadastro.rating,
+
+    veiculo: p.veiculo,
+  };
+}
+
 export function montarPosicao(
   row: MotoristaRow,
   pos: {

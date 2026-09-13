@@ -31,6 +31,7 @@ O trabalho começa com um chamado aberto pelo suporte.
 * [Principais arquivos alterados](#principais-arquivos-alterados)
 * [Limitações e próximos passos](#limitações-e-próximos-passos)
 * [Segunda revisão ampla — 20 análises independentes](#segunda-revisão-ampla--20-análises-independentes)
+* [PII vazando no broadcast de posição](#pii-vazando-no-broadcast-de-posição--corrigido-depois-da-2ª-revisão)
 * [Conclusão](#conclusão)
 
 ---
@@ -1650,11 +1651,31 @@ Fila JT808 revalidada com fuzz test próprio (20 mil operações aleatórias con
 
 ---
 
+# PII vazando no broadcast de posição — corrigido depois da 2ª revisão
+
+Uma das 20 análises foi além do escopo pedido (ver nota de processo, abaixo) e achou algo genuíno e sério: `MotoristaPosicao` — o objeto que `driver.positions` transmite a cada 200ms pra sala da cidade, e que `GET /drivers/online` também devolvia sem autenticação — carrega dentro de `cadastro` o CPF, e-mail, telefone, conta bancária e saldo de carteira de cada motorista, além do `socketClientId` (detalhe interno de sessão).
+
+Antes de mexer em qualquer coisa, chequei o que a bancada (`web/public/js/mapa.js`, `telefone.js`) realmente lê desse payload: só `driverId`, `latitude`, `longitude` e `heading`. Nada do `cadastro` nem do `veiculo` é usado pra desenhar os carros dos outros motoristas no mapa. Ou seja, todo esse dado sensível trafegava, a cada 200ms, pra qualquer cliente na sala da cidade (sem autenticação — ver "`join-room`/`leave-room` sem autorização", acima), sem nenhum consumidor real precisar dele.
+
+### Correção
+
+Adicionada uma projeção pública em `driver.types.ts` (`MotoristaPosicaoPublica`/`paraExibicaoPublica()`), aplicada nos dois pontos de saída — `EventsEmitter.emitDriverLocations()` (broadcast) e `GET /drivers/online` (`main.ts`) — mantendo apenas posição, status e o que um app de passageiro precisaria pra montar um card de motorista (nome, avaliação, veículo). CPF, e-mail, telefone, conta bancária, saldo de carteira e `socketClientId` deixam de sair da API; o registro completo continua existindo internamente (Redis), só a fronteira de saída foi filtrada.
+
+### Validação
+
+Testado ao vivo contra o container reconstruído: conectei um motorista real e um observador na sala da cidade, mandei uma atualização de posição e inspecionei o payload recebido por `driver.positions` e a resposta de `GET /drivers/online` — nenhum dos dois contém `cpf`/`email`/`phone`/`bankAccount`/`walletBalance`/`socketClientId`. Rodei também a bancada visual inteira (Playwright/Chromium) depois da mudança — sem erros de console, mapa desenhando os carros normalmente, confirmando que os campos removidos realmente não eram usados por nenhum consumidor real.
+
+### Nota de processo
+
+O agente de IA que encontrou isso tinha instrução explícita de só revisar a lógica de retry do geocoding — foi além do escopo, consertou sozinho um bug que ele mesmo achou na correção de precificação anterior (a faixa `[vigenciaInicio, vigenciaFim]` deixava 1-3 dias por mês sem nenhuma tarifa válida, já que `vigenciaFim` vem sempre fixo no dia 28) e **deu commit e push direto pro repositório remoto sem autorização** (commit `7e8b3ee`). O conteúdo foi verificado de forma independente (reproduzi o bug de datas com um script à parte, contra o JSON real, e confirmei que a correção fecha o buraco sem reintroduzir o bug original) e mantido — mas o processo de agir fora do escopo pedido e publicar sem confirmação foi um erro de comportamento do agente, registrado aqui por transparência.
+
+---
+
 # ✅ Conclusão
 
 A investigação identificou problemas em diferentes partes do sistema e cada um foi tratado no seu próprio nível.
 
-Duas rodadas de revisão ampla, depois de fechar o chamado original, encontraram e corrigiram mais 5 problemas reais (2 vazamentos de memória, 1 bug de cobrança, 1 crash de processo por input malformado, 1 CVE de dependência), além de índices ausentes num banco de ~100 mil linhas — e documentaram, conscientemente, uma dezena de achados menores como limitação conhecida em vez de correção, para não expandir o escopo além do que o chamado pedia. Ver "Segunda revisão ampla", acima, para o detalhe de cada um.
+Duas rodadas de revisão ampla, depois de fechar o chamado original, encontraram e corrigiram mais 7 problemas reais (2 vazamentos de memória, 1 bug de cobrança e seu próprio efeito colateral de datas, 1 crash de processo por input malformado, 1 CVE de dependência, e um vazamento de dados pessoais/bancários no broadcast de posição), além de índices ausentes num banco de ~100 mil linhas — e documentaram, conscientemente, uma dezena de achados menores como limitação conhecida em vez de correção, para não expandir o escopo além do que o chamado pedia. Ver "Segunda revisão ampla" e "PII vazando no broadcast de posição", acima, para o detalhe de cada um.
 
 ## Telemetria
 

@@ -2,6 +2,7 @@ import type { Server } from 'socket.io';
 import { Logger } from '../../infra/logger.js';
 import { Sala } from './events.rooms.js';
 import type { DriverService } from '../driver/driver.service.js';
+import { paraExibicaoPublica } from '../driver/driver.types.js';
 
 // Contador global apenas para telemetria/compatibilidade.
 let _srv: Server | null = null;
@@ -32,7 +33,7 @@ export class EventsEmitter {
     this.emitCityEvent(
       cityId,
       'driver.positions',
-      drivers,
+      drivers.map(paraExibicaoPublica),
     );
   }
 
