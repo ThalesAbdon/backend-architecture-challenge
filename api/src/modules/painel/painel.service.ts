@@ -42,6 +42,10 @@ export class PainelService {
 
   private async publicar(cityId: number) {
     const r = await consultar(`SELECT * FROM trips WHERE city_id = ? ORDER BY created_at DESC LIMIT ?`, [cityId, this.janela]);
-    this.emitter.emitEvent('city.summary', { cityId, em: Date.now(), corridas: r });
+
+    // Mesmo bug do driver.positions (broadcast global): este feed é
+    // por cidade, mas emitEvent() manda pra todo mundo. Usa emitCityEvent
+    // pra restringir à sala city:{cityId}, igual foi feito no gateway.
+    this.emitter.emitCityEvent(cityId, 'city.summary', { cityId, em: Date.now(), corridas: r });
   }
 }
